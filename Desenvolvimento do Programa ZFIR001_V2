@@ -1,0 +1,876 @@
+*&---------------------------------------------------------------------*
+*& REPORT zfir001
+*&---------------------------------------------------------------------*
+*&
+*&---------------------------------------------------------------------*
+REPORT zfir001.
+
+*----------------------------------------------------------------------
+* Tipos e Constantes
+*----------------------------------------------------------------------
+CONSTANTS: cgrp TYPE c VALUE 'S'.          " Grupo dos radiobuttons
+
+*----------------------------------------------------------------------
+* Globais para importação do Excel
+*----------------------------------------------------------------------
+TYPES: BEGIN OF ty_excel_data,
+         tipo_ln        TYPE string,      " Tipo da linha
+         item_no_acc    TYPE string,      " Número do item
+         header_txt     TYPE string,      " Texto do cabeçalho
+         comp_code      TYPE string,      " Código da empresa
+         doc_date       TYPE d,           " Data do documento
+         pstng_date     TYPE d,           " Data de lançamento
+         fisc_year      TYPE string,      " Ano fiscal
+         fis_period     TYPE string,      " Período fiscal
+         ref_doc_no     TYPE string,      " Número do documento de referência
+         customer       TYPE string,      " Cliente
+         item_text      TYPE string,      " Texto do item
+         alloc_nmbr     TYPE string,      " Número da alocação
+         bline_date     TYPE d,           " Data do item
+         currency_iso   TYPE string,      " Moeda
+         amt_doccur     TYPE string,      " Valor do documento
+         gl_account     TYPE string,      " Conta contábil
+         item_text_r    TYPE string,      " Histórico do lançamento
+         alloc_nmbr_r   TYPE string,      " Atribuição
+         costcenter     TYPE string,      " Centro de custo
+         profit_ctr     TYPE string,      " Centro de lucro
+         currency_iso_r TYPE string,      " Código da Moeda
+         amt_doccur_r   TYPE string,      " Valor do documento
+       END OF ty_excel_data,
+
+       BEGIN OF ty_data,
+         partner1 TYPE bu_partner,
+         partner2 TYPE bu_partner,
+       END OF ty_data.
+
+DATA: wa_header       TYPE bapiache09,                                " Cabeçalho do documento
+      lt_account      TYPE TABLE OF bapiacar09,                       " Conta contábil (GL)
+      lt_receivable   TYPE TABLE OF bapiacar09,                       " Conta a Receber
+      lt_currency     TYPE TABLE OF bapiaccr09,                       " Moeda e valores monetários
+      lt_return       TYPE TABLE OF bapiret2,                         " Retorno da BAPI
+      lv_obj_type     TYPE bapiache09-obj_type,                       " Tipo de objeto
+      lv_obj_key      TYPE bapiache09-obj_key,                        " Chave do objeto
+      lv_obj_sys      TYPE bapiache09-obj_sys,                        " Sistema de origem
+      gv_xls_xstr     TYPE xstring,                                   " Conteúdo do arquivo Excel em XSTRING
+      gt_bin          TYPE solix_tab,                                 " Binário do arquivo
+      go_excel        TYPE REF TO if_fdt_doc_spreadsheet,             " Objeto Excel
+      gt_sheet_names  TYPE if_fdt_doc_spreadsheet=>t_worksheet_names, " Nomes das abas do Excel
+      lv_line_counter TYPE i,                                         " Contador de linha
+      it_excel_data   TYPE TABLE OF ty_excel_data,                    " Tabela para armazenar os dados do Excel
+      ls_excel_data   TYPE ty_excel_data,                             " Estrutura para uma linha de dados
+      gv_bin_len      TYPE i.                                         " Estrutura para uma linha de dados
+
+DATA: lt_filetab TYPE filetable,
+      lv_rc      TYPE i,
+      lv_full    TYPE string.
+
+FIELD-SYMBOLS: <lt_raw> TYPE STANDARD TABLE,
+               <ls_raw> TYPE any,
+               <fv>     TYPE any.
+
+TYPE-POOLS: slis.
+
+TYPES: BEGIN OF ty_alv_msg,
+         comp_code  TYPE bukrs,
+         doc_type   TYPE blart,
+         obj_key    TYPE bapiache09-obj_key,
+         ref_doc_no TYPE bapiache09-ref_doc_no,
+         type       TYPE bapiret2-type,
+         message    TYPE char255,
+       END OF ty_alv_msg.
+
+DATA: gt_alv_log TYPE STANDARD TABLE OF ty_alv_msg WITH DEFAULT KEY.
+
+DATA: lv_aux_customer TYPE bapiacar09-customer.
+
+" TVARV
+DATA lv_gl_account TYPE tvarvc-low.
+SELECT SINGLE low
+  INTO lv_gl_account  "47
+  FROM tvarvc
+ WHERE name   = 'ZID44-GL_ACCOUNT'.
+
+DATA lv_doctype TYPE tvarvc-low.
+SELECT SINGLE low
+  INTO lv_doctype "DG
+  FROM tvarvc
+ WHERE name   = 'ZID44-DOCTYPE'.
+
+DATA lv_len       TYPE i.
+*----------------------------------------------------------------------
+* Seleção
+*----------------------------------------------------------------------
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE TEXT-t01.
+
+  PARAMETERS:
+    p_bukrs TYPE bukrs.               "Empresa
+
+  PARAMETERS:
+    p_loc RADIOBUTTON GROUP cgrp DEFAULT 'X' USER-COMMAND uc_src,
+    p_ser RADIOBUTTON GROUP cgrp.
+
+  " Local
+  SELECTION-SCREEN BEGIN OF LINE.
+    SELECTION-SCREEN COMMENT (20) TEXT-t02 FOR FIELD p_file MODIF ID l.
+    PARAMETERS p_file TYPE rlgrap-filename MODIF ID l.
+  SELECTION-SCREEN END OF LINE.
+
+  " Servidor
+  SELECTION-SCREEN BEGIN OF LINE.
+    SELECTION-SCREEN COMMENT (20) TEXT-t03 FOR FIELD p_path MODIF ID s.
+    PARAMETERS p_path TYPE string MODIF ID s LOWER CASE.
+  SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN END OF BLOCK b1.
+
+*----------------------------------------------------------------------
+* Inicialização
+*----------------------------------------------------------------------
+INITIALIZATION.
+  PERFORM toggle_fields.
+
+*----------------------------------------------------------------------
+* Manipulação dinâmica da tela
+*----------------------------------------------------------------------
+AT SELECTION-SCREEN OUTPUT.
+  PERFORM toggle_fields.
+
+FORM toggle_fields.
+  LOOP AT SCREEN.
+    CASE screen-group1.
+      WHEN 'L'.
+        IF p_loc = abap_true.
+          screen-active    = 1.
+          screen-invisible = 0.
+        ELSE.
+          screen-active    = 0.
+          screen-invisible = 1.
+        ENDIF.
+      WHEN 'S'.
+        IF p_ser = abap_true.
+          screen-active    = 1.
+          screen-invisible = 0.
+        ELSE.
+          screen-active    = 0.
+          screen-invisible = 1.
+        ENDIF.
+    ENDCASE.
+    MODIFY SCREEN.
+  ENDLOOP.
+ENDFORM.
+
+*----------------------------------------------------------------------
+* F4 para selecionar arquivo local (.xlsx)
+*----------------------------------------------------------------------
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file.
+  IF p_ser = abap_true.
+    RETURN.
+  ENDIF.
+
+  cl_gui_frontend_services=>file_open_dialog(
+    EXPORTING
+      default_extension = 'xlsx'
+      file_filter       = 'Planilhas Excel (*.xlsx)|*.xlsx|Todos (*.*)|*.*'
+      multiselection    = abap_false
+    CHANGING
+      file_table        = lt_filetab
+      rc                = lv_rc
+    EXCEPTIONS
+      OTHERS            = 1 ).
+
+  IF sy-subrc = 0 AND lv_rc > 0.
+    READ TABLE lt_filetab INDEX 1 INTO DATA(ls_file).
+    IF sy-subrc = 0.
+      lv_full = ls_file-filename.
+      p_file  = lv_full.
+    ENDIF.
+  ENDIF.
+
+*----------------------------------------------------------------------
+* Reação à troca do rádio + Validações só no Executar
+*----------------------------------------------------------------------
+AT SELECTION-SCREEN.
+  " 1) Troca do rádio (USER-COMMAND da PARAMETERS): limpar campo oposto
+  IF sy-ucomm = 'UC_SRC'.
+    IF p_loc = abap_true.
+      CLEAR p_path.
+    ELSEIF p_ser = abap_true.
+      CLEAR p_file.
+    ENDIF.
+  ENDIF.
+
+  " 2) Validar SOMENTE quando o usuário clicar em Executar (F8)
+  IF sy-ucomm = 'ONLI'.
+    IF p_bukrs IS INITIAL.
+      MESSAGE e398(00) WITH 'Informe a Empresa'''''''''.
+    ELSE.
+    ENDIF.
+
+    " Se Local: exige p_file e valida existência no front
+    IF p_loc = abap_true.
+      IF p_file IS INITIAL.
+        MESSAGE e398(00) WITH 'Informe o arquivo local (.xlsx) em' 'Arquivo (Local)'''''''''.
+      ELSE.
+        DATA(lv_exists_local) = abap_false.
+        cl_gui_frontend_services=>file_exist(
+          EXPORTING
+            file   = CONV string( p_file )
+          RECEIVING
+            result = lv_exists_local
+          EXCEPTIONS
+            OTHERS = 1 ).
+        IF lv_exists_local = abap_false.
+          MESSAGE e398(00) WITH 'Arquivo local não encontrado:' p_file.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+    " Se Servidor: exige p_path e valida o acesso ao arquivo no app server
+    IF p_ser = abap_true.
+      IF p_path IS INITIAL.
+        MESSAGE e398(00) WITH 'Informe o caminho/arquivo no servidor (AL11) em' 'Arquivo (Servidor/AL11)'''''''''.
+      ELSE.
+        DATA(lv_handle) = 0.
+        OPEN DATASET p_path FOR INPUT IN BINARY MODE.
+        IF sy-subrc <> 0.
+          MESSAGE e398(00) WITH 'Arquivo no servidor não acessível:' p_path ''''''.
+        ELSE.
+          CLOSE DATASET p_path.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+*----------------------------------------------------------------------
+* Execução
+*----------------------------------------------------------------------
+START-OF-SELECTION.
+  PERFORM import_excel.
+
+*----------------------------------------------------------------------
+* Lê o arquivo (Local/Servidor) e monta gv_xls_xstr
+*----------------------------------------------------------------------
+FORM import_excel.
+  CLEAR: gv_xls_xstr, gt_bin.
+
+  IF p_loc = abap_true.
+    PERFORM read_local_file.
+  ELSE.
+    PERFORM read_server_file.
+  ENDIF.
+
+  " 1) BIN -> XSTRING
+  DATA: lv_xstr TYPE xstring,
+        lv_ok   TYPE abap_bool.
+
+  PERFORM z_bin_to_xstring USING    gt_bin gv_bin_len
+                           CHANGING lv_xstr lv_ok.
+  IF lv_ok = abap_false OR lv_xstr IS INITIAL.
+    MESSAGE e398(00) WITH 'Falha ao converter binário para XSTRING.'''''''''.
+    RETURN.
+  ENDIF.
+
+  " 2) Excel (XSTRING) -> preencher/postar via BAPI
+  PERFORM z_excel_to_bapi USING lv_xstr.
+ENDFORM.
+
+  "--- Macro: ler coluna N da linha atual para lv_val_str -----------
+  DEFINE get_col.
+    ASSIGN COMPONENT &1 OF STRUCTURE <ls_data_bin> TO <fv>.
+    IF sy-subrc = 0.
+      lv_val_str = |{ <fv> }|.
+    ELSE.
+      CLEAR lv_val_str.
+    ENDIF.
+  END-OF-DEFINITION.
+
+  "--- Macro: postar doc atual + log/commit/rollback ----------------
+  DEFINE post_current_doc.
+    IF lv_in_doc = abap_true.
+      CLEAR: lt_return, lv_bapi_obj_type, lv_bapi_obj_key, lv_bapi_obj_sys.
+
+      CALL FUNCTION 'BAPI_ACC_DOCUMENT_POST'
+        EXPORTING
+          documentheader    = ls_header
+        IMPORTING
+          obj_type          = lv_bapi_obj_type
+          obj_key           = lv_bapi_obj_key
+          obj_sys           = lv_bapi_obj_sys
+        TABLES
+          accountgl         = lt_accountgl
+          accountreceivable = lt_receivable
+          currencyamount    = lt_currency
+          return            = lt_return.
+
+      lv_bapi_has_error = abap_false.
+      LOOP AT lt_return ASSIGNING <rmsg>.
+        IF <rmsg>-type CA 'AEX'.
+          lv_bapi_has_error = abap_true.
+        ENDIF.
+        PERFORM zlog_append USING ls_header lv_bapi_obj_key <rmsg>.
+      ENDLOOP.
+
+      IF lv_bapi_has_error = abap_false.
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING wait = abap_true.
+      ELSE.
+        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+      ENDIF.
+
+      CLEAR: ls_header, lt_accountgl, lt_receivable, lt_currency.
+      lv_in_doc = abap_false.
+    ENDIF.
+  END-OF-DEFINITION.
+
+*----------------------------------------------------------------------
+* Lê arquivo local (PC) em modo binário usando GUI_UPLOAD
+*----------------------------------------------------------------------
+FORM read_local_file.
+
+  CALL FUNCTION 'GUI_UPLOAD'
+    EXPORTING
+      filename                = CONV string( p_file )
+      filetype                = 'BIN'
+    IMPORTING
+      filelength              = gv_bin_len
+    TABLES
+      data_tab                = gt_bin
+    EXCEPTIONS
+      file_open_error         = 1
+      file_read_error         = 2
+      no_batch                = 3
+      gui_refuse_filetransfer = 4
+      invalid_type            = 5
+      no_authority            = 6
+      unknown_error           = 7
+      bad_data_format         = 8
+      header_not_allowed      = 9
+      separator_not_allowed   = 10
+      header_too_long         = 11
+      unknown_dp_error        = 12
+      access_denied           = 13
+      dp_out_of_memory        = 14
+      disk_full               = 15
+      dp_timeout              = 16
+      OTHERS                  = 17.
+
+  IF sy-subrc <> 0 OR gt_bin IS INITIAL.
+    MESSAGE e398(00) WITH |Falha ao ler arquivo (BIN): { p_file }''''''|.
+  ENDIF.
+
+ENDFORM.
+
+*----------------------------------------------------------------------
+* Lê arquivo no app server (AL11) em modo binário
+*----------------------------------------------------------------------
+FORM read_server_file.
+  DATA: lv_xstr  TYPE xstring,
+        lv_chunk TYPE xstring,
+        lv_len   TYPE i.
+
+  CLEAR: gt_bin, gv_bin_len, lv_xstr.
+
+  " Sempre BINÁRIO para Excel
+  OPEN DATASET p_path FOR INPUT IN BINARY MODE.
+  IF sy-subrc <> 0.
+    MESSAGE e398(00) WITH |Não foi possível abrir em modo binário: { p_path }''''''|.
+    RETURN.
+  ENDIF.
+
+  " Lê em blocos e acumula em XSTRING
+  DO.
+    READ DATASET p_path INTO lv_chunk LENGTH lv_len.
+    IF sy-subrc <> 0.
+      EXIT.
+    ENDIF.
+    IF lv_len > 0.
+      " xstring já guarda apenas os bytes lidos
+      CONCATENATE lv_xstr lv_chunk INTO lv_xstr IN BYTE MODE.
+    ENDIF.
+  ENDDO.
+
+  CLOSE DATASET p_path.
+
+  " Converte XSTRING -> SOLIX_TAB (gt_bin) e seta comprimento
+  CALL FUNCTION 'SCMS_XSTRING_TO_BINARY'
+    EXPORTING
+      buffer     = lv_xstr
+    TABLES
+      binary_tab = gt_bin.
+*    EXCEPTIONS
+*      failed     = 1
+*      OTHERS     = 2.
+  IF sy-subrc <> 0 OR gt_bin IS INITIAL.
+    MESSAGE e398(00) WITH 'Falha convertendo p/ SOLIX_TAB (SCMS_XSTRING_TO_BINARY)'''''''''.  " opcional
+    RETURN.
+  ENDIF.
+
+  gv_bin_len = xstrlen( lv_xstr ).
+ENDFORM.
+
+*----------------------------------------------------------------------
+* Pega os dados e coloca na BAPI
+*----------------------------------------------------------------------
+FORM z_excel_to_bapi
+  USING iv_xstr TYPE xstring.
+
+  "=== Objetos/estruturas para Excel ================================
+  DATA: lo_excel      TYPE REF TO cl_fdt_xl_spreadsheet,
+        lt_worksheets TYPE STANDARD TABLE OF string,
+        lv_worksheet  TYPE string,
+        lo_data       TYPE REF TO data.
+
+  "=== Buffers / estados ============================================
+  DATA: lv_bapi_has_error TYPE abap_bool,
+        lv_in_doc         TYPE abap_bool VALUE abap_false,
+        lv_cnt_r          TYPE i VALUE 0,
+        lv_cnt_c          TYPE i VALUE 0.
+
+  "=== Field-symbols p/ leitura dinâmica das linhas/colunas =========
+  FIELD-SYMBOLS: <lt_data_bin> TYPE STANDARD TABLE,
+                 <ls_data_bin> TYPE any,
+                 <fv>          TYPE any,
+                 <rmsg>        TYPE bapiret2.
+
+  "=== BAPI buffers =================================================
+  DATA: ls_header     TYPE bapiache09,
+        lt_accountgl  TYPE STANDARD TABLE OF bapiacgl09 WITH DEFAULT KEY,
+        lt_receivable TYPE STANDARD TABLE OF bapiacar09 WITH DEFAULT KEY,
+        lt_currency   TYPE STANDARD TABLE OF bapiaccr09 WITH DEFAULT KEY,
+        lt_return     TYPE STANDARD TABLE OF bapiret2.
+
+  "=== Estruturas de trabalho reutilizadas ==========================
+  DATA: ls_gl   TYPE bapiacgl09,
+        ls_ar   TYPE bapiacar09,
+        ls_cur  TYPE bapiaccr09,
+        ls_curc TYPE bapiaccr09.
+
+  "=== Auxiliares ===================================================
+  DATA: lv_val_str  TYPE string,
+        lv_ok       TYPE abap_bool,
+        lv_amt      TYPE bapiwrbtr,
+        lv_prefix   TYPE c LENGTH 2.
+
+  "=== IDs de retorno do POST ======================================
+  DATA: lv_bapi_obj_type TYPE bapiache09-obj_type,
+        lv_bapi_obj_key  TYPE bapiache09-obj_key,
+        lv_bapi_obj_sys  TYPE bapiache09-obj_sys.
+
+  "--- Cria o objeto Excel a partir do XSTRING ----------------------
+  CREATE OBJECT lo_excel
+    EXPORTING
+      document_name = 'Planilha_.xlsx'
+      xdocument     = iv_xstr.
+
+  IF lo_excel IS BOUND.
+    lo_excel->if_fdt_doc_spreadsheet~get_worksheet_names(
+      IMPORTING worksheet_names = lt_worksheets ).
+  ENDIF.
+
+  IF lt_worksheets IS INITIAL.
+    DATA ls_fake_hdr TYPE bapiache09.
+    DATA ls_fake_ret TYPE bapiret2.
+    CLEAR: ls_fake_hdr, ls_fake_ret.
+    ls_fake_ret-type    = 'E'.
+    ls_fake_ret-id      = 'ZMSG'.
+    ls_fake_ret-number  = '000'.
+    ls_fake_ret-message = 'Sem planilhas no arquivo.'''''''''.
+    PERFORM zlog_append USING ls_fake_hdr '' ls_fake_ret.
+    PERFORM zlog_display.
+    RETURN.
+  ENDIF.
+
+  "====================== LOOP nas planilhas ========================
+  LOOP AT lt_worksheets INTO lv_worksheet.
+
+    lo_data = lo_excel->if_fdt_doc_spreadsheet~get_itab_from_worksheet( lv_worksheet ).
+    ASSIGN lo_data->* TO <lt_data_bin>.
+    IF <lt_data_bin> IS NOT ASSIGNED.
+      CONTINUE.
+    ENDIF.
+
+    "------------------- LOOP nas linhas (da 5ª em diante) ----------
+    LOOP AT <lt_data_bin> ASSIGNING <ls_data_bin>.
+      IF sy-tabix = 1.
+        CONTINUE.
+      ENDIF.
+
+      " Coluna A (1) => tipo H/R/C
+      get_col 1.
+
+      CASE lv_val_str.
+        WHEN 'H'.
+          " Fecha/posta doc anterior e zera buffers
+          CLEAR lv_aux_customer.
+          post_current_doc.
+
+          CLEAR: ls_header, lt_accountgl, lt_receivable, lt_currency.
+          lv_in_doc = abap_true.
+          CLEAR: lv_cnt_r, lv_cnt_c.
+
+          " DOCUMENTHEADER (BAPIACHE09)
+          ls_header-obj_type = 'BKPFF'.
+          ls_header-obj_key  = '$'.
+          ls_header-username = sy-uname.
+
+          " C=3 HEADER_TXT ; D=4 COMP_CODE
+          get_col 3.  ls_header-header_txt = lv_val_str.
+          get_col 4.  ls_header-comp_code  = lv_val_str.
+
+          " Validação: empresa do cabeçalho x empresa da seleção
+          IF ls_header-comp_code IS INITIAL OR ls_header-comp_code <> p_bukrs.
+            DATA ls_fake_ret2 TYPE bapiret2.
+            CLEAR ls_fake_ret2.
+            ls_fake_ret2-type    = 'E'.
+            ls_fake_ret2-id      = 'ZMSG'.
+            ls_fake_ret2-number  = '001'.
+            ls_fake_ret2-message = |Empresa do cabeçalho ({ ls_header-comp_code }) difere da seleção ({ p_bukrs })''''|.
+            PERFORM zlog_append USING ls_header '' ls_fake_ret2.
+            CLEAR: ls_header, lt_accountgl, lt_receivable, lt_currency.
+            lv_in_doc = abap_false.
+            CONTINUE.
+          ENDIF.
+
+          " E=5 DOC_DATE ; F=6 PSTNG_DATE ; G=7 FISC_YEAR ; H=8 FIS_PERIOD ; I=9 REF_DOC_NO
+          get_col 5.  PERFORM z_conv_date USING lv_val_str CHANGING ls_header-doc_date   lv_ok.
+          get_col 6.  PERFORM z_conv_date USING lv_val_str CHANGING ls_header-pstng_date lv_ok.
+          get_col 7.  ls_header-fisc_year  = lv_val_str.
+          get_col 8.  ls_header-fis_period = lv_val_str.
+          ls_header-doc_type = lv_doctype.
+          get_col 9.  ls_header-ref_doc_no = lv_val_str.
+
+        WHEN 'R'.
+          IF lv_in_doc = abap_false.
+            CONTINUE.
+          ENDIF.
+
+          CLEAR ls_gl.
+          " B=2 ; P=16 ; Q=17 ; R=18 ; S=19 ; T=20
+          get_col 2.
+
+          ls_gl-itemno_acc = lv_val_str.
+
+          get_col 16.
+          CLEAR lv_len.
+          lv_len = strlen( lv_val_str ).
+          IF lv_len >= 10.
+            ls_gl-gl_account = lv_val_str.
+          ELSE.
+            CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+            EXPORTING input  = lv_val_str
+            IMPORTING output = ls_gl-gl_account.
+          ENDIF.
+          get_col 17. ls_gl-item_text  = lv_val_str.
+          get_col 18. ls_gl-alloc_nmbr = lv_val_str.
+          get_col 19. ls_gl-costcenter = lv_val_str.
+          get_col 20. ls_gl-profit_ctr = lv_val_str.
+
+          " TAX_CODE (S0 quando prefixo GL = TVARV lv_gl_account)
+          CLEAR lv_prefix.
+          lv_prefix = ls_gl-gl_account+0(2).
+          IF lv_gl_account IS NOT INITIAL AND lv_prefix = lv_gl_account.
+            ls_gl-tax_code = 'S0'.
+          ENDIF.
+
+          " TAXJURCODE (se já houver cliente no documento)
+          IF ls_gl-tax_code IS NOT INITIAL AND lv_aux_customer IS NOT INITIAL.
+            SELECT SINGLE a~taxjurcode
+              INTO ls_gl-taxjurcode
+              FROM but000 AS b
+              INNER JOIN but020 AS u ON u~partner   = b~partner
+              INNER JOIN adrc  AS a ON a~addrnumber = u~addrnumber
+             WHERE b~partner = lv_aux_customer.
+          ENDIF.
+
+          " Só agora grava o GL (já com tax code/jur code)
+          APPEND ls_gl TO lt_accountgl.
+          ADD 1 TO lv_cnt_r.
+
+          " CURRENCYAMOUNT do R: N=14 (currency) / O=15 (amount)
+          CLEAR ls_cur.
+          ls_cur-itemno_acc = ls_gl-itemno_acc.
+          get_col 21. ls_cur-currency_iso = lv_val_str.
+          get_col 22. PERFORM z_norm_amount USING lv_val_str CHANGING lv_amt.
+          ls_cur-amt_doccur = lv_amt.
+          APPEND ls_cur TO lt_currency.
+
+        WHEN 'C'.
+          IF lv_in_doc = abap_false.
+            CONTINUE.
+          ENDIF.
+
+          CLEAR ls_ar.
+          " B=2 ; J=10 ; K=11 ; L=12 ; N=14 (bline_date)
+          get_col 2.  ls_ar-itemno_acc = lv_val_str.
+          get_col 10.
+          CLEAR lv_len.
+          lv_len = strlen( lv_val_str ).
+*          IF lv_len >= 10.
+*            ls_gl-gl_account = lv_val_str.
+*          ELSE.
+            CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+            EXPORTING input  = lv_val_str
+            IMPORTING output = ls_ar-customer.
+*          ENDIF.
+          "ls_ar-customer   = lv_val_str.
+          lv_aux_customer = ls_ar-customer.
+          get_col 11. ls_ar-item_text  = lv_val_str.
+          get_col 12. ls_ar-alloc_nmbr = lv_val_str.
+          get_col 14. PERFORM z_conv_date USING lv_val_str CHANGING ls_ar-bline_date lv_ok.
+          APPEND ls_ar TO lt_receivable.
+
+          CLEAR ls_curc.
+          " CURRENCYAMOUNT do C: N=14 / O=15
+          ls_curc-itemno_acc   = ls_ar-itemno_acc.
+          get_col 14. ls_curc-currency_iso = lv_val_str.
+          get_col 15. PERFORM z_norm_amount USING lv_val_str CHANGING lv_amt.
+          ls_curc-amt_doccur   = lv_amt.
+          APPEND ls_curc TO lt_currency.
+
+          ADD 1 TO lv_cnt_c.
+
+      ENDCASE.
+    ENDLOOP.
+
+    CLEAR lv_aux_customer.
+    post_current_doc.
+
+  ENDLOOP.
+
+  PERFORM zlog_display.
+
+ENDFORM.
+
+"====================[ U T I L S ]====================
+FORM z_conv_date USING    iv_any   TYPE any
+                 CHANGING cv_date  TYPE d
+                          cv_ok    TYPE abap_bool.
+
+  DATA: lv_raw    TYPE string,
+        lv_t1     TYPE string,
+        lv_t2     TYPE string,
+        lv_t3     TYPE string,
+        lv_digits TYPE string,
+        lv_char   TYPE c LENGTH 1,
+        lv_i      TYPE i,
+        lv_y      TYPE i,
+        lv_m      TYPE i,
+        lv_d      TYPE i,
+        lv_int    TYPE i,
+        lv_first4 TYPE string.
+
+  CLEAR: cv_date, cv_ok.
+  lv_raw = |{ iv_any }|.
+  CONDENSE lv_raw.
+
+  IF lv_raw IS INITIAL.
+    RETURN.
+  ENDIF.
+
+  " --- Caso com separadores (/, -, ., espaço) ---
+  IF lv_raw CS '/' OR lv_raw CS '-' OR lv_raw CS ' ' OR lv_raw CS '.'. " sem REGEX
+    REPLACE ALL OCCURRENCES OF '/' IN lv_raw WITH space.
+    REPLACE ALL OCCURRENCES OF '-' IN lv_raw WITH space.
+    REPLACE ALL OCCURRENCES OF '.' IN lv_raw WITH space.
+    CONDENSE lv_raw.
+    SPLIT lv_raw AT space INTO lv_t1 lv_t2 lv_t3.
+
+    IF lv_t1 IS NOT INITIAL AND lv_t2 IS NOT INITIAL AND lv_t3 IS NOT INITIAL.
+      IF strlen( lv_t1 ) = 4.                " yyyy mm dd
+        lv_y = lv_t1. lv_m = lv_t2. lv_d = lv_t3.
+      ELSE.                                   " dd mm yyyy
+        lv_d = lv_t1. lv_m = lv_t2. lv_y = lv_t3.
+      ENDIF.
+      IF lv_y BETWEEN 1900 AND 9999 AND lv_m BETWEEN 1 AND 12 AND lv_d BETWEEN 1 AND 31.
+        cv_date = |{ lv_y WIDTH = 4 PAD = '0' }{ lv_m WIDTH = 2 PAD = '0' }{ lv_d WIDTH = 2 PAD = '0' }|.
+        cv_ok   = abap_true.
+        RETURN.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  " --- Só dígitos / possível serial do Excel ---
+  CLEAR lv_digits.
+  DO strlen( lv_raw ) TIMES.
+    lv_i    = sy-index - 1.
+    lv_char = lv_raw+lv_i(1).
+    IF lv_char CO '0123456789'.
+      CONCATENATE lv_digits lv_char INTO lv_digits IN CHARACTER MODE.
+    ENDIF.
+  ENDDO.
+
+  IF strlen( lv_digits ) = 8.                 " yyyymmdd ou ddmmyyyy
+    lv_first4 = lv_digits(4).
+    IF lv_first4 >= '1900'.
+      cv_date = lv_digits.                    " yyyymmdd
+    ELSE.
+      cv_date = |{ lv_digits+4(4) }{ lv_digits+2(2) }{ lv_digits(2) }|. " ddmmyyyy
+    ENDIF.
+    cv_ok = abap_true.
+    RETURN.
+  ENDIF.
+
+  " --- Serial Excel (1 = 1900-01-01; corrige o dia 60) ---
+  TRY.
+      lv_int = lv_digits.
+    CATCH cx_sy_conversion_no_number.
+      lv_int = 0.
+  ENDTRY.
+  IF lv_int > 0.
+    DATA(lv_base) = CONV d( '18991231' ).
+    IF lv_int >= 60.
+      lv_int = lv_int - 1.
+    ENDIF.
+    cv_date = lv_base + lv_int.
+    cv_ok   = abap_true.
+  ENDIF.
+
+ENDFORM.
+
+FORM z_norm_amount USING    iv_any TYPE any
+                   CHANGING cv_amt TYPE bapiwrbtr.
+
+  DATA: lv_in   TYPE string,
+        lv_out  TYPE string,
+        lv_char TYPE c LENGTH 1,
+        lv_i    TYPE i.
+
+  CLEAR cv_amt.
+  lv_in = |{ iv_any }|.
+  IF lv_in IS INITIAL.
+    RETURN.
+  ENDIF.
+
+  " vírgula -> ponto
+  TRANSLATE lv_in USING ',.'.
+
+  " filtra somente 0-9 . -
+  CLEAR lv_out.
+  DO strlen( lv_in ) TIMES.
+    lv_i    = sy-index - 1.
+    lv_char = lv_in+lv_i(1).
+    IF lv_char CO '0123456789.-'.
+      CONCATENATE lv_out lv_char INTO lv_out IN CHARACTER MODE.
+    ENDIF.
+  ENDDO.
+
+  IF lv_out IS INITIAL.
+    CLEAR cv_amt.
+  ELSE.
+    cv_amt = lv_out.
+  ENDIF.
+
+ENDFORM.
+"---------------- ALV: monta catálogo ----------------
+FORM zlog_build_fieldcat CHANGING pt_fieldcat TYPE slis_t_fieldcat_alv.
+
+  PERFORM zlog_set_column USING
+         'COMP_CODE'  'EMPRESA'   'Empresa'        'Empresa'
+         CHANGING pt_fieldcat.
+  PERFORM zlog_set_column USING
+         'DOC_TYPE'   'TIPO DOC'  'Tipo Doc.'      'Tipo do Documento'
+         CHANGING pt_fieldcat.
+  PERFORM zlog_set_column USING
+         'OBJ_KEY'    'NR GERADO' 'Nr Doc Gerado'  'Número do Documento Gerado'
+         CHANGING pt_fieldcat.
+  PERFORM zlog_set_column USING
+         'REF_DOC_NO' 'REF NC'    'Ref. NC'        'Referência Nota de Crédito'
+         CHANGING pt_fieldcat.
+  PERFORM zlog_set_column USING
+         'TYPE'       'STATUS'      'Status'       'Status'
+         CHANGING pt_fieldcat.
+  PERFORM zlog_set_column USING
+         'MESSAGE'    'MENSAGEM'  'Mensagem'       'Mensagem'
+         CHANGING pt_fieldcat.
+ENDFORM.
+
+"---------------- ALV: helper de coluna ----------------
+FORM zlog_set_column
+  USING    pv_fieldname TYPE slis_fieldcat_alv-fieldname
+           pv_short     TYPE scrtext_s
+           pv_medium    TYPE scrtext_m
+           pv_long      TYPE scrtext_l
+  CHANGING pt_fieldcat  TYPE slis_t_fieldcat_alv.
+
+  DATA ls_fcat TYPE slis_fieldcat_alv.
+  CLEAR ls_fcat.
+  ls_fcat-fieldname = pv_fieldname.
+  ls_fcat-seltext_s = pv_short.
+  ls_fcat-seltext_m = pv_medium.
+  ls_fcat-seltext_l = pv_long.
+  APPEND ls_fcat TO pt_fieldcat.
+ENDFORM.
+
+"---------------- ALV: add 1 linha ao log ----------------
+FORM zlog_append USING    ps_header  TYPE bapiache09
+                           pv_objkey TYPE bapiache09-obj_key
+                           ps_return TYPE bapiret2.
+
+  IF ps_return-id = 'RW' AND ps_return-number = '609'.
+    RETURN.
+  ENDIF.
+
+  DATA ls_log TYPE ty_alv_msg.
+  CLEAR ls_log.
+  ls_log-comp_code  = ps_header-comp_code.
+  ls_log-doc_type   = ps_header-doc_type.
+  ls_log-obj_key    = pv_objkey.
+  ls_log-ref_doc_no = ps_header-ref_doc_no.
+  ls_log-type       = ps_return-type.
+  CONCATENATE ps_return-id ps_return-number ps_return-message
+         INTO ls_log-message SEPARATED BY space.
+  APPEND ls_log TO gt_alv_log.
+ENDFORM.
+
+"---------------- ALV: exibir grid ---------------------
+FORM zlog_display.
+  DATA: lt_fieldcat TYPE slis_t_fieldcat_alv,
+        ls_layout   TYPE slis_layout_alv.
+
+  ls_layout-zebra               = 'X'.
+  ls_layout-colwidth_optimize   = 'X'.
+
+  PERFORM zlog_build_fieldcat CHANGING lt_fieldcat.
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program = sy-repid
+      is_layout          = ls_layout
+      it_fieldcat        = lt_fieldcat
+      i_save             = 'A'
+    TABLES
+      t_outtab           = gt_alv_log
+    EXCEPTIONS
+      program_error      = 1
+      OTHERS             = 2.
+ENDFORM.
+
+*----------------------------------------------------------------------*
+* Converte SOLIX_TAB (binário) e length em XSTRING
+*----------------------------------------------------------------------*
+FORM z_bin_to_xstring
+  USING    it_bin    TYPE solix_tab
+           iv_len    TYPE i
+  CHANGING cv_xstr   TYPE xstring
+           cv_ok     TYPE abap_bool.
+
+  CLEAR: cv_xstr, cv_ok.
+
+  CALL FUNCTION 'SCMS_BINARY_TO_XSTRING'
+    EXPORTING
+      input_length = iv_len
+    IMPORTING
+      buffer       = cv_xstr
+    TABLES
+      binary_tab   = it_bin
+    EXCEPTIONS
+      failed       = 1
+      OTHERS       = 2.
+
+  IF sy-subrc = 0 AND cv_xstr IS NOT INITIAL.
+    cv_ok = abap_true.
+  ELSE.
+    cv_ok = abap_false.
+  ENDIF.
+
+ENDFORM.
